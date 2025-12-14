@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Van Gogh Particles + Hands</title>
+  <style>
+    html, body { margin:0; padding:0; overflow:hidden; background:#000; }
+    canvas { display:block; }
+    #hud{
+      position:fixed; left:12px; top:12px; z-index:10;
+      color:#cfcfcf; font:12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      opacity:.9; user-select:none; pointer-events:none;
+      text-shadow:0 1px 2px rgba(0,0,0,.6);
+      white-space:pre;
+    }
+    #overlay{
+      position:fixed; inset:0; z-index:20;
+      display:flex; align-items:center; justify-content:center;
+      background:rgba(0,0,0,.75);
+      color:#fff;
+      font:14px/1.6 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    #panel{
+      width:min(520px, calc(100vw - 40px));
+      border:1px solid rgba(255,255,255,.15);
+      border-radius:12px;
+      padding:18px 16px;
+      background:rgba(10,10,10,.65);
+      backdrop-filter: blur(6px);
+    }
+    #btnStart{
+      margin-top:12px;
+      width:100%;
+      padding:10px 12px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,.18);
+      background:rgba(255,255,255,.08);
+      color:#fff;
+      cursor:pointer;
+    }
+    #btnStart:active{ transform: translateY(1px); }
+    #small{
+      margin-top:10px;
+      color:rgba(255,255,255,.75);
+      font-size:12px;
+    }
+    video{ display:none; }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+
+  <div id="overlay">
+    <div id="panel">
+      <div id="msg">加载资源中…</div>
+      <button id="btnStart" disabled>请稍候…</button>
+      <div id="small">
+        操作：张开手 → 流动星云；握拳（从张开到握拳的瞬间）→ 切换画作并重组。<br/>
+        说明：如果没有检测到手，会保持当前画作形态。
+      </div>
+    </div>
+  </div>
+
+  <video id="input_video" playsinline></video>
+
+  <!-- Three.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+  <!-- MediaPipe Hands + Camera Utils (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+  (() => {
+    'use strict';
+
+    // =========================
+    // 参数区（可按需调）
+    // =========================
+    const PARTICLE_COUNT = 40000;
+
+    // 画面收纳到相机视域的比例（越大越满屏）
+    const FIT = 0.92;
+
+    // 画作模式：回归/重组的“弹簧强度”和阻尼
+    const SPRING = 16.0;
+    const DAMPING = 0.86;
+
+    // 星云模式：手掌吸引强度、噪声强度、阻尼
+    const ATTRACT = 0.55;
+    const NOISE_STRENGTH = 0.55;
+    const FLOW_DAMPING = 0.90;
+
+    // 切换时颜色跟随速度（越大变色越快）
+    const COLOR_FOLLOW = 10.0;
+
+    // 握拳触发切换的冷却（ms）
+    const SWITCH_COOLDOWN = 650;
+
+    // =========================
+    // 工具函数
+    // =========================
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+
+    // dt 下的指数阻尼（保证不同帧率手感一致）
+    const expDamp = (base, dt) => Math.pow(base, dt * 60);
+
+    // =========================
+    // 资源：Wikimedia CORS 友好图源
+    // =========================
+    const PAINTING_SOURCES = [
+      {
+        name: '星月夜 Starry Night',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/2560px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg'
+      },
+      {
+        name: '向日葵 Sunflowers',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9d/Vincent_van_Gogh_-_Sunflowers_-_VGM_F458.jpg/1562px-Vincent_van_Gogh_-_Sunflowers_-_VGM_F458.jpg'
+      },
+      {
+        name: '麦田群鸦 Wheatfield with Crows',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/d/d3/Vincent_Van_Gogh_-_Wheatfield_with_Crows.jpg/2560px-Vincent_Van_Gogh_-_Wheatfield_with_Crows.jpg'
+      },
+      {
+        name: '罗纳河上的星夜 Starry Night Over the Rhône',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Starry_Night_Over_the_Rhone.jpg/2560px-Starry_Night_Over_the_Rhone.jpg'
+      }
+    ];
+
+    function loadImage(url) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.decoding = 'async';
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('图片加载失败: ' + url));
+        img.src = url;
+      });
+    }
+
+    // 从图片抽取像素色彩，并为 N 个粒子生成：
+    // 1) uv（[-1,1] 的平面坐标，后续根据相机尺寸映射到世界坐标）
+    // 2) color（RGB 0..1）
+    function buildPaintingData(img, N) {
+      const aspect = img.width / img.height;
+
+      // 用近似匹配宽高比的网格采样，保证 N = gridW * gridH 近似成立
+      let gridW = Math.round(Math.sqrt(N * aspect));
+      gridW = clamp(gridW, 120, 420);
+      let gridH = Math.round(N / gridW);
+
+      // 保证乘积 >= N，避免越界
+      while (gridW * gridH < N) gridH++;
+
+      const cvs = document.createElement('canvas');
+      cvs.width = gridW;
+      cvs.height = gridH;
+      const ctx = cvs.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, gridW, gridH);
+
+      const { data } = ctx.getImageData(0, 0, gridW, gridH);
+
+      const uv = new Float32Array(N * 2);
+      const col = new Float32Array(N * 3);
+
+      // 从左到右、从上到下填充粒子
+      for (let i = 0; i < N; i++) {
+        const x = i % gridW;
+        const y = (i / gridW) | 0;
+
+        const p = (y * gridW + x) * 4;
+
+        // uv: [-1,1]，y 轴翻转使图像正立
+        const u = (x / (gridW - 1)) * 2 - 1;
+        const v = 1 - (y / (gridH - 1)) * 2;
+
+        uv[i * 2 + 0] = u;
+        uv[i * 2 + 1] = v;
+
+        col[i * 3 + 0] = data[p + 0] / 255;
+        col[i * 3 + 1] = data[p + 1] / 255;
+        col[i * 3 + 2] = data[p + 2] / 255;
+      }
+
+      return { uv, col, aspect };
+    }
+
+    // =========================
+    // Three.js：粒子系统
+    // =========================
+    let renderer, scene, camera, material, points, geometry;
+    const pos = new Float32Array(PARTICLE_COUNT * 3);      // currentPosition
+    const vel = new Float32Array(PARTICLE_COUNT * 3);      // velocity
+    const tgt = new Float32Array(PARTICLE_COUNT * 3);      // targetPosition
+    const col = new Float32Array(PARTICLE_COUNT * 3);      // current color
+    const colTgt = new Float32Array(PARTICLE_COUNT * 3);   // target color
+
+    function initThree() {
+      scene = new THREE.Scene();
+
+      renderer = new THREE.WebGLRenderer({
+        antialias: false,
+        powerPreference: 'high-performance'
+      });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setClearColor(0x000000, 1);
+      document.body.appendChild(renderer.domElement);
+
+      // 采用正交相机：便于把图像 uv 映射到“屏幕空间”
+      const aspect = innerWidth / innerHeight;
+      camera = new THREE.OrthographicCamera(-aspect, aspect, 1, -1, 0.01, 10);
+      camera.position.z = 2;
+
+      geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute('color', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage));
+
+      const vertexShader = `
+        attribute vec3 color;
+        varying vec3 vColor;
+        uniform float uPointSize;
+        uniform float uPixelRatio;
+        void main(){
+          vColor = color;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+
+          // 正交相机下点大小不随距离变化，这里用 z 做轻微“假景深”
+          float zBoost = 1.0 + clamp(position.z, -0.8, 0.8) * 0.35;
+          gl_PointSize = uPointSize * uPixelRatio * zBoost;
+
+          gl_Position = projectionMatrix * mv;
+        }
+      `;
+
+      const fragmentShader = `
+        precision mediump float;
+        varying vec3 vColor;
+        void main(){
+          // 软粒子：中心亮，边缘淡
+          vec2 p = gl_PointCoord - 0.5;
+          float d = dot(p, p);
+          float a = smoothstep(0.25, 0.0, d);
+          gl_FragColor = vec4(vColor, a);
+        }
+      `;
+
+      material = new THREE.ShaderMaterial({
+        vertexShader,
+        fragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+        uniforms: {
+          uPointSize: { value: 2.2 },
+          uPixelRatio: { value: Math.min(devicePixelRatio, 2) }
+        }
+      });
+
+      points = new THREE.Points(geometry, material);
+      scene.add(points);
+
+      addEventListener('resize', onResize, { passive: true });
+      onResize();
+    }
+
+    function onResize() {
+      const aspect = innerWidth / innerHeight;
+      camera.left = -aspect;
+      camera.right = aspect;
+      camera.top = 1;
+      camera.bottom = -1;
+      camera.updateProjectionMatrix();
+
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      material.uniforms.uPixelRatio.value = Math.min(devicePixelRatio, 2);
+
+      // 相机变化会改变画布映射，刷新当前画作的 targetPosition
+      if (paintings.length) applyPaintingTargets(currentPaintingIndex);
+    }
+
+    // =========================
+    // 画作数据
+    // ========================
+=
+    const paintings = []; // {name, uv, col, aspect}
+    let currentPaintingIndex = 0;
+
+    function applyPaintingTargets(index) {
+      const p = paintings[index];
+      const camRight = camera.right;
+      const camTop = camera.top;
+
+      // 将 uv 映射到世界坐标，形成“画作平面”
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const u = p.uv[i * 2 + 0];
+        const v = p.uv[i * 2 + 1];
+
+        tgt[i * 3 + 0] = u * camRight * FIT;
+        tgt[i * 3 + 1] = v * camTop * FIT;
+        tgt[i * 3 + 2] = 0;
+
+        colTgt[i * 3 + 0] = p.col[i * 3 + 0];
+        colTgt[i * 3 + 1] = p.col[i * 3 + 1];
+        colTgt[i * 3 + 2] = p.col[i * 3 + 2];
+      }
+    }
+
+    function setCurrentAsTargets() {
+      applyPaintingTargets(currentPaintingIndex);
+    }
+
+    // =========================
+    // MediaPipe Hands：手势识别
+    // =========================
+    const hand = {
+      seen: false,
+      // 归一化坐标 [0,1]
+      cx: 0.5,
+      cy: 0.5,
+      // 手掌尺度（用于阈值归一）
+      size: 0.25
+    };
+
+    let gesture = 'none';     // 'none' | 'open' | 'fist'
+    let lastGesture = 'none';
+    let lastSwitchAt = -1;
+
+    function classifyGesture(landmarks) {
+      // 取掌心中心：wrist(0) + MCP(5,9,13,17) 平均
+      const palmIdx = [0, 5, 9, 13, 17];
+      let sx = 0, sy = 0;
+      for (let k = 0; k < palmIdx.length; k++) {
+        const lm = landmarks[palmIdx[k]];
+        sx += lm.x; sy += lm.y;
+      }
+      sx /= palmIdx.length;
+      sy /= palmIdx.length;
+
+      // 镜像 x，让控制更像“自拍镜子”
+      const cx = 1 - sx;
+      const cy = sy;
+
+      // 手掌尺度：wrist(0) 到 middle_mcp(9)
+      const a = landmarks[0], b = landmarks[9];
+      const dx0 = (a.x - b.x), dy0 = (a.y - b.y);
+      const palmSize = Math.sqrt(dx0 * dx0 + dy0 * dy0) + 1e-6;
+
+      // 指尖到掌心的平均距离
+      const tips = [4, 8, 12, 16, 20];
+      let sum = 0;
+      for (let k = 0; k < tips.length; k++) {
+        const t = landmarks[tips[k]];
+        const dx = (t.x - sx), dy = (t.y - sy);
+        sum += Math.sqrt(dx * dx + dy * dy);
+      }
+      const avgTipDist = sum / tips.length;
+
+      const ratio = avgTipDist / palmSize;
+
+      // 简单阈值 + 中间区间保持上一次（做滞回，减少抖动）
+      let g = gesture;
+      if (ratio > 1.75) g = 'open';
+      else if (ratio < 1.20) g = 'fist';
+      // 否则 g 不变
+
+      // 平滑 hand center，避免硬拖拽
+      hand.cx = lerp(hand.cx, cx, 0.35);
+      hand.cy = lerp(hand.cy, cy, 0.35);
+      hand.size = lerp(hand.size, palmSize, 0.25);
+
+      return g;
+    }
+
+    async function startHands() {
+      const videoElement = document.getElementById('input_video');
+
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+
+      hands.onResults((results) => {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          hand.seen = true;
+          gesture = classifyGesture(results.multiHandLandmarks[0]);
+        } else {
+          hand.seen = false;
+          gesture = 'none';
+        }
+      });
+
+      // 摄像头驱动：每帧喂给 hands
+      const cam = new Camera(videoElement, {
+        onFrame: async () => {
+          await hands.send({ image: videoElement });
+        },
+        width: 640,
+        height: 480
+      });
+
+      await cam.start();
+    }
+
+    // =========================
+    // 状态：画作模式 / 星云模式
+    // =========================
+    let mode = 'painting'; // 'painting' | 'flow'
+
+    function enterFlow() {
+      mode = 'flow';
+      // 进入星云时，让粒子“炸开”一点点（破画成星）
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const ix = i * 3;
+        vel[ix + 0] += (Math.random() - 0.5) * 1.2;
+        vel[ix + 1] += (Math.random() - 0.5) * 1.2;
+        vel[ix + 2] += (Math.random() - 0.5) * 1.6;
+        pos[ix + 2] = (Math.random() - 0.5) * 0.9;
+      }
+      geometry.attributes.position.needsUpdate = true;
+    }
+
+    function exitFlow() {
+      mode = 'painting';
+      // 回到画作时，target 保持当前画作（或切换后的新画作）
+      setCurrentAsTargets();
+    }
+
+    function switchPainting() {
+      if (!paintings.length) return;
+      let next = currentPaintingIndex;
+      while (next === currentPaintingIndex) {
+        next = (Math.random() * paintings.length) | 0;
+      }
+      currentPaintingIndex = next;
+      applyPaintingTargets(currentPaintingIndex);
+    }
+
+    // =========================
+    // 动画循环：requestAnimationFrame 更新粒子
+    // =========================
+    const hud = document.getElementById('hud');
+
+    let tPrev = performance.now();
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min(0.033, (now - tPrev) / 1000);
+      tPrev = now;
+
+      // 手势状态机
+      if (hand.seen) {
+        if (gesture === 'open' && mode !== 'flow') enterFlow();
+        if (gesture !== 'open' && mode !== 'painting') exitFlow();
+
+        // 边缘触发：上一帧 open，这一帧 fist => 切换画作
+        if (lastGesture === 'open' && gesture === 'fist') {
+          if (now - lastSwitchAt > SWITCH_COOLDOWN) {
+            lastSwitchAt = now;
+            switchPainting();
+          }
+        }
+      } else {
+        // 未检测到手：保持画作形态
+        if (mode !== 'painting') exitFlow();
+      }
+      lastGesture = gesture;
+
+      // hand center（屏幕归一）-> 世界坐标（相机视域）
+      const hx = (hand.cx * 2 - 1) * camera.right;
+      const hy = (1 - hand.cy * 2) * camera.top;
+
+      // 更新粒子
+      const dampPaint = expDamp(DAMPING, dt);
+      const dampFlow = expDamp(FLOW_DAMPING, dt);
+      const colorFollow = 1 - Math.exp(-COLOR_FOLLOW * dt);
+
+      const time = now * 0.001;
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const ix = i * 3;
+
+        let px = pos[ix + 0], py = pos[ix + 1], pz = pos[ix + 2];
+        let vx = vel[ix + 0], vy = vel[ix + 1], vz = vel[ix + 2];
+
+        if (mode === 'flow') {
+          // 流动星云：受到手掌中心的引力 + 平滑噪声扰动
+          if (hand.seen) {
+            const dx = hx - px;
+            const dy = hy - py;
+            const dist2 = dx * dx + dy * dy + 0.06;
+
+        // 近处更强，远处更弱：类似引力衰减
+            const f = (ATTRACT / dist2);
+
+            vx += dx * f * dt;
+            vy += dy * f * dt;
+
+            // 轻微“绕流”：让吸引不死板
+            vx += (-dy) * f * dt * 0.12;
+            vy += ( dx) * f * dt * 0.12;
+          }
+
+          // 平滑噪声场（简化的“类 curl”流动）
+          const nX = Math.sin(py * 3.1 + time * 1.2) + Math.cos(pz * 2.2 + time * 0.8);
+          const nY = Math.sin(pz * 2.7 + time * 1.0) - Math.cos(px * 3.0 + time * 0.7);
+          const nZ = Math.sin(px * 2.4 + time * 0.6) + Math.cos(py * 2.9 + time * 0.5);
+
+          vx += nX * NOISE_STRENGTH * dt * 0.20;
+          vy += nY * NOISE_STRENGTH * dt * 0.20;
+          vz += nZ * NOISE_STRENGTH * dt * 0.18;
+
+          // 微弱回心力：防止飞出视野太远
+          vx += (-px) * 0.06 * dt;
+          vy += (-py) * 0.06 * dt;
+          vz += (-pz) * 0.10 * dt;
+
+          vx *= dampFlow;
+          vy *= dampFlow;
+          vz *= dampFlow;
+
+          // 星云模式下颜色保持不变（仍是当前画作的颜色）
+        } else {
+          // 画作模式：弹簧回归 targetPosition（重组/切换）
+          const tx = tgt[ix + 0], ty = tgt[ix + 1], tz = tgt[ix + 2];
+
+          vx += (tx - px) * SPRING * dt;
+          vy += (ty - py) * SPRING * dt;
+          vz += (tz - pz) * SPRING * dt;
+
+          vx *= dampPaint;
+          vy *= dampPaint;
+          vz *= dampPaint;
+
+          // 颜色跟随 target color（切换画作时会渐变）
+          col[ix + 0] += (colTgt[ix + 0] - col[ix + 0]) * colorFollow;
+          col[ix + 1] += (colTgt[ix + 1] - col[ix + 1]) * colorFollow;
+          col[ix + 2] += (colTgt[ix + 2] - col[ix + 2]) * colorFollow;
+        }
+
+        // 限速：避免数值爆炸
+        const sp2 = vx * vx + vy * vy + vz * vz;
+        const maxSp = (mode === 'flow') ? 2.6 : 3.2;
+        const maxSp2 = maxSp * maxSp;
+        if (sp2 > maxSp2) {
+          const inv = maxSp / Math.sqrt(sp2);
+          vx *= inv; vy *= inv; vz *= inv;
+        }
+
+        px += vx * dt;
+        py += vy * dt;
+        pz += vz * dt;
+
+        pos[ix + 0] = px; pos[ix + 1] = py; pos[ix + 2] = pz;
+        vel[ix + 0] = vx; vel[ix + 1] = vy; vel[ix + 2] = vz;
+      }
+
+      geometry.attributes.position.needsUpdate = true;
+      geometry.attributes.color.needsUpdate = true;
+
+      renderer.render(scene, camera);
+
+      // HUD
+      const name = paintings[currentPaintingIndex]?.name ?? '—';
+      hud.textContent =
+        `画作：${name}\n` +
+        `手势：${hand.seen ? gesture : 'none'}\n` +
+        `模式：${mode}\n` +
+        `粒子：${PARTICLE_COUNT}`;
+    }
+
+    // =========================
+    // 启动流程：预加载图片 -> 初始化 -> 点击启动摄像头
+    // =========================
+    const overlay = document.getElementById('overlay');
+    const msg = document.getElementById('msg');
+    const btn = document.getElementById('btnStart');
+
+    async function boot() {
+      try {
+        msg.textContent = '预加载 4 张画作并抽取像素…';
+        const imgs = await Promise.all(PAINTING_SOURCES.map(s => loadImage(s.url)));
+
+        for (let i = 0; i < imgs.length; i++) {
+          const data = buildPaintingData(imgs[i], PARTICLE_COUNT);
+          paintings.push({
+            name: PAINTING_SOURCES[i].name,
+            uv: data.uv,
+            col: data.col,
+            aspect: data.aspect
+          });
+        }
+
+        msg.textContent = '初始化 Three.js 粒子系统…';
+        initThree();
+
+        // 初始：直接摆成第一幅画
+        currentPaintingIndex = 0;
+        applyPaintingTargets(currentPaintingIndex);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+          const ix = i * 3;
+          pos[ix + 0] = tgt[ix + 0];
+          pos[ix + 1] = tgt[ix + 1];
+          pos[ix + 2] = (Math.random() - 0.5) * 0.02;
+
+          col[ix + 0] = colTgt[ix + 0];
+          col[ix + 1] = colTgt[ix + 1];
+          col[ix + 2] = colTgt[ix + 2];
+
+          vel[ix + 0] = (Math.random() - 0.5) * 0.01;
+          vel[ix + 1] = (Math.random() - 0.5) * 0.01;
+          vel[ix + 2] = (Math.random() - 0.5) * 0.01;
+        }
+
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+
+        msg.textContent = '就绪：点击按钮启动摄像头与手势识别';
+        btn.textContent = '启动（需要摄像头权限）';
+        btn.disabled = false;
+
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          btn.textContent = '启动中…';
+          try {
+            await startHands();
+            overlay.style.display = 'none';
+          } catch (e) {
+            console.error(e);
+            btn.disabled = false;
+            btn.textContent = '启动失败，重试';
+            msg.textContent = '摄像头启动失败：请确认在 http://localhost 打开，并允许摄像头权限。';
+          }
+        });
+
+        requestAnimationFrame((t) => {
+          tPrev = t;
+          requestAnimationFrame(animate);
+        });
+
+      } catch (e) {
+        console.error(e);
+        msg.textContent = '加载失败：' + (e?.message || e);
+        btn.textContent = '无法启动';
+        btn.disabled = true;
+      }
+    }
+
+    boot();
+  })();
+  </script>
+</body>
+</html>
